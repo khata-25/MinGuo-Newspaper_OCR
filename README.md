@@ -40,7 +40,44 @@ python -m pip install -r requirements.txt
 - `processing.concurrency`：并发数量，网络不稳定时适当调小。
 - `processing.request_interval`：请求间隔（秒）。
 
-## 快速开始（推荐）
+## 快速开始
+
+### 🎯 方式一：交互式 GUI（推荐新手）
+**全新的交互式图形界面，支持单文件上传识别，实时显示结果！**
+
+#### Windows 用户：
+双击运行 `START_INTERACTIVE.bat`
+
+#### Linux/Mac 用户：
+```bash
+chmod +x start_interactive.sh
+./start_interactive.sh
+```
+
+或直接运行：
+```bash
+python interactive_gui.py
+```
+
+#### 功能特性：
+- ✅ 单文件上传识别
+- ✅ 实时图像预览（带区域标注）
+- ✅ 实时识别结果显示
+- ✅ 进度跟踪
+- ✅ 保存结果到本地
+- ✅ 友好的操作界面
+
+#### 打包发布（可选）：
+如需将软件打包成独立可执行文件：
+```bash
+pip install pyinstaller
+python package_app.py
+```
+生成的可执行文件在 `dist/` 目录中，无需 Python 环境即可运行。
+
+---
+
+### 📦 方式二：批量处理（命令行）
 异步版更稳定，适合批量和网络波动场景：
 ```
 python main_async.py -i images/42 -o output/full_batch_run_42
@@ -50,6 +87,9 @@ python main_async.py -i images/42 -o output/full_batch_run_42
 ```
 python main.py -i images/42 -o output/full_batch_run_42
 ```
+
+#### Windows 用户批量处理 GUI：
+双击运行 `START_GUI.bat` 启动批量处理工具箱
 
 ## 运行模式
 ### 1) 全流程（Stage 1 + Stage 2）
@@ -134,8 +174,42 @@ streamlit run visualize.py
 - 网络波动：直接重跑同命令，断点续传会跳过已完成页。
 
 ## 运行入口速览
+### 交互式界面（推荐）
+- **交互式 GUI**（单文件识别）：
+  - Windows: `START_INTERACTIVE.bat` 或 `python interactive_gui.py`
+  - Linux/Mac: `./start_interactive.sh` 或 `python interactive_gui.py`
+  - 功能：上传图片 → 实时预览 → 识别 → 查看结果 → 保存
+
+### 批量处理（命令行）
 - 全流程：`main.py` / `main_async.py`
 - 批量：`batch_runner.py` / `batch_runner_stage2.py` / `batch_fix_runner.py`
 - 修复：`fix_failed_images.py` / `fix_failed_images_2.py`
-- 可视化：`visualize.py`
-- GUI（Windows）：`START_GUI.bat`
+- 批量工具箱 GUI（Windows）：`START_GUI.bat`
+
+### 可视化与校对
+- 可视化校对：`streamlit run visualize.py`
+
+## 软件打包与分发
+如需将交互式 GUI 打包成独立可执行文件（无需 Python 环境）：
+
+### 1. 安装打包工具
+```bash
+pip install pyinstaller
+```
+
+### 2. 运行打包脚本
+```bash
+python package_app.py
+```
+
+### 3. 分发软件
+打包完成后，可执行文件位于 `dist/` 目录：
+- Windows: `dist/MinGuoOCR_Interactive.exe`
+- Linux/Mac: `dist/MinGuoOCR_Interactive`
+
+将以下文件一起分发给用户：
+- 可执行文件（上述 exe 或二进制文件）
+- `config.json`（需配置 API 密钥）
+- 使用说明
+
+用户双击即可运行，无需安装 Python 环境！
