@@ -1,0 +1,36 @@
+{
+  "api": {
+    "qwen_vl": {
+      "api_key": "改为你的API密钥",
+      "model": "qwen3-vl-plus",
+      "timeout": 120
+    }
+  },
+  "layout": {
+    "engine": "paddlevl_api",
+    "min_area": 900,
+    "confidence_threshold": 0.5,
+    "region_padding": 4,
+    "show_log": true,
+    "sorting": {
+      "column_gap_ratio": 0.04,
+      "column_gap_px": 0
+    },
+    "api_url": "改为你的paddleOCR的url",
+    "token": "改为你的paddleOCR的url的token",
+    "timeout": 600
+  },
+  "processing": {
+    "max_region_size": 2200,
+    "jpeg_quality": 90,
+    "request_interval": 0.1,
+    "concurrency": 5
+  },
+  "recognizer": {
+    "engine": "qwen_vl"
+  },
+  "paths": {
+    "input_base": "images",
+    "output_base": "output"
+  }
+}
