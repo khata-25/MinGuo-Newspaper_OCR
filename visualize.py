@@ -1,628 +1,353 @@
 import streamlit as st
 import os
 import glob
-from PIL import Image
 import json
 import base64
 from io import BytesIO
-import streamlit.components.v1 as components
+import pandas as pd
+import zipfile
 
-# --- Config & CSS ---
-st.set_page_config(layout="wide", page_title="长沙大公报识别校对", initial_sidebar_state="expanded")
+# Try importing PIL, handle if missing
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    st.error("PIL (Pillow) library not found. Please install it.")
 
-# CSS: Cleaner UI, Compact Header, Hidden Streamlit Elements
+# --- Config & Setup ---
+st.set_page_config(layout="wide", page_title="民国报纸 OCR 校对平台", initial_sidebar_state="expanded")
+
+# --- Styles ---
 st.markdown("""
     <style>
-        /* Compact Header */
-        .block-container { padding-top: 0.5rem; padding-bottom: 0rem; }
-        /* header { visibility: hidden; } REMOVED: Caused sidebar toggle to disappear */
-        
-        /* Typography */
-        h3 { font-size: 1.2rem !important; margin: 0 !important; padding: 0 !important;}
-        .stMarkdown p { font-size: 0.9rem; }
-        
-        /* Compact Tabs */
-        .stTabs [data-baseweb="tab-list"] { gap: 4px; margin-bottom: 10px; }
-        .stTabs [data-baseweb="tab"] { height: 35px; padding: 4px 12px; font-size: 0.9rem; }
-        
-        /* Sidebar tweaks */
-        section[data-testid="stSidebar"] .block-container { padding-top: 1rem; }
-        
-        /* Hide full screen button on images to prevent UI clutter */
-        button[title="View fullscreen"] { display: none; }
+        .block-container { padding-top: 1rem; padding-bottom: 2rem; }
+        .stButton button { width: 100%; border-radius: 4px; }
+        .success-box { padding: 10px; background-color: #d4edda; color: #155724; border-radius: 4px; margin-bottom: 10px;}
+        /* Make data editor taller */
+        div[data-testid="stDataEditor"] > div { height: 100%; min-height: 600px; } 
     </style>
 """, unsafe_allow_html=True)
 
 # --- Helper Functions ---
-def get_subdirs(path):
-    if not os.path.exists(path): return []
-    return [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
 
-def load_files(image_dir, output_dir):
-    if not os.path.isdir(image_dir) or not os.path.isdir(output_dir): return []
-    layout_files = glob.glob(os.path.join(output_dir, "**", "layout.json"), recursive=True)
-    supported_img_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.pdf']
-    pairs = []
+@st.cache_data
+def load_file_pairs(image_dir, output_dir):
+    """Scan directories and pair images with their OCR results."""
+    if not os.path.exists(image_dir) or not os.path.exists(output_dir): 
+        return []
     
-    # Pre-scan markdowns to avoid repeated OS calls
-    # Map dir -> md_path
+    # Recursively find all layout.json files
+    layout_files = glob.glob(os.path.join(output_dir, "**", "layout.json"), recursive=True)
+    
+    pairs = []
+    supported_exts = ['.jpg', '.jpeg', '.png', '.bmp']
     
     for layout_path in layout_files:
         subdir = os.path.dirname(layout_path)
         dirname = os.path.basename(subdir)
         
-        # Locate Markdown
-        md_path = None
-        candidates = [
-            os.path.join(output_dir, f"{dirname}.md"),
-            os.path.join(subdir, f"{dirname}.md")
-        ]
-        for c in candidates:
-            if os.path.exists(c):
-                md_path = c
-                break
+        # Determine paths
+        md_path = os.path.join(subdir, f"{dirname}.md")
         
-        # Locate Image
+        # Find matching image
         img_path = None
-        for ext in supported_img_exts:
-            potential_path = os.path.join(image_dir, dirname + ext)
-            if os.path.exists(potential_path):
-                img_path = potential_path
+        # Try finding image with same name in image_dir
+        for ext in supported_exts:
+            potential = os.path.join(image_dir, dirname + ext)
+            if os.path.exists(potential):
+                img_path = potential
                 break
         
         if img_path:
-             pairs.append({
+            pairs.append({
                 "name": dirname,
-                "image": img_path,
-                "layout": layout_path,
-                "markdown": md_path,
-                "sort_key": dirname
+                "image_path": img_path,
+                "layout_path": layout_path,
+                "markdown_path": md_path,
+                "display_name": f"📄 {dirname}"
             })
-    pairs.sort(key=lambda x: x["sort_key"])
+            
+    # Sort by name
+    pairs.sort(key=lambda x: x["name"])
     return pairs
 
-def pil_to_base64(img, quality=80):
-    buffered = BytesIO()
-    if img.mode == 'RGBA': img = img.convert('RGB')
-    img.save(buffered, format="JPEG", quality=quality)
-    return base64.b64encode(buffered.getvalue()).decode()
-
-def search_files(query, file_pairs):
-    """Global search in markdown content and layout text."""
-    results = []
-    if not query: return []
-    q = query.lower()
-    
-    for idx, pair in enumerate(file_pairs):
-        # 1. Search Markdown (Preferred)
-        if pair["markdown"]:
-            try:
-                with open(pair["markdown"], 'r', encoding='utf-8') as f:
-                    content = f.read().lower()
-                if q in content:
-                    # Extract context
-                    match_idx = content.find(q)
-                    start = max(0, match_idx - 10)
-                    end = min(len(content), match_idx + 20)
-                    snippet = content[start:end].replace('\n', ' ')
-                    results.append({
-                        "index": idx,
-                        "name": pair["name"],
-                        "match": f"...{snippet}...",
-                        "source": "MD"
-                    })
-                    continue # Found in MD, skip layout to avoid dupes per file
-            except: pass
-            
-        # 2. Search Layout JSON
-        if pair["layout"]:
-            try:
-                with open(pair["layout"], 'r', encoding='utf-8') as f:
-                    layout = json.load(f)
-                for r in layout.get('regions', []):
-                    if q in r.get('text', '').lower():
-                         results.append({
-                            "index": idx,
-                            "name": pair["name"],
-                            "match": f"[{r.get('id')}] {r.get('text')[:15]}...",
-                            "source": "OCR"
-                        })
-                         break
-            except: pass
-    return results
-
-def generate_interactive_viewer(image_path, layout_path, zoom_level=100, show_text_list=True, split_ratio=70):
-    """
-    Generates HTML component with:
-    1. Top horizontal scrollbar.
-    2. JS-based local search/filter.
-    3. Vertical layout safe rendering.
-    4. Adjustable Split Ratio
-    """
+def load_data(layout_path):
+    """Load regions from JSON."""
     try:
-        pil_image = Image.open(image_path)
-        w, h = pil_image.size
-        img_b64 = pil_to_base64(pil_image)
-        
         with open(layout_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            regions = data.get('regions', [])
-            
-        # Minimal JSON for frontend
-        js_regions = []
-        for r in regions:
-            js_regions.append({
-                "id": str(r.get('id', r.get('order', ''))),
-                "text": r.get('text', '') or "(空)",
-                "type": r.get('region_type', 'text'),
-                # Geometry %
-                "x": (r['bbox'][0] / w) * 100,
-                "y": (r['bbox'][1] / h) * 100,
-                "w": ((r['bbox'][2] - r['bbox'][0]) / w) * 100,
-                "h": ((r['bbox'][3] - r['bbox'][1]) / h) * 100
-            })
-        js_regions_json = json.dumps(js_regions)
-        
+        return data.get('regions', [])
     except Exception as e:
-        return f"<div style='color:red'>Data Load Error: {e}</div>"
+        st.error(f"Error loading JSON: {e}")
+        return []
 
-    img_width_style = f"{zoom_level}%"
-    text_col_flex = 100 - split_ratio if show_text_list else 0
-    img_col_flex = split_ratio
-
-    html_template = f"""
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <style>
-            :root {{
-                --bg-color: #f0f2f6;
-                --border-color: #ddd;
-                --highlight-color: #ff4b4b;
-                --hover-color: #262730;
-            }}
-            body {{
-                margin: 0; padding: 0;
-                font-family: sans-serif;
-                background-color: var(--bg-color);
-                height: 800px; /* Viewport Height */
-                display: flex;
-                overflow: hidden;
-            }}
-            
-            /* --- Layout Columns --- */
-            .main-container {{
-                display: flex;
-                flex: 1;
-                height: 100%;
-                width: 100%;
-            }}
-            
-            .image-column {{
-                flex: {img_col_flex};
-                display: flex;
-                flex-direction: column;
-                min-width: 0; /* Flexbox safety */
-                border-right: 1px solid var(--border-color);
-                background: #e5e5e5;
-                position: relative;
-            }}
-            
-            .text-column {{
-                flex: {text_col_flex};
-                display: {'flex' if show_text_list else 'none'};
-                flex-direction: column;
-                background: white;
-                border-left: 1px solid #ccc;
-                flex-shrink: 0;
-                min-width: 0;
-            }}
-            
-            /* --- Top Scrollbar Sync Logic --- */
-            /* A dummy div at top to provide the scrollbar */
-            #top-scroll-track {{
-                width: 100%;
-                height: 18px;
-                overflow-x: auto;
-                overflow-y: hidden;
-                background: #f1f1f1;
-                flex-shrink: 0;
-                border-bottom: 1px solid #ccc;
-            }}
-            #top-scroll-dummy {{
-                height: 1px;
-                width: {zoom_level}%; /* Must match image width */
-            }}
-            
-            /* The real scrolling container for image */
-            #image-scroll-view {{
-                flex: 1;
-                overflow: auto; /* Allow both, but we hide X scrollbar via CSS if we can, or just let it sync */
-                position: relative;
-                padding: 20px;
-                /* Hide native scrollbar if we only want top? 
-                   Browsers make this hard. We'll keep default behavior + top sync 
-                */
-            }}
-            
-            /* Hide bottom scrollbar to force top usage? Risk of bad UX. 
-               Let's just keep both or let top control bottom. 
-            */
-            
-            /* Image Wrapper */
-            #image-wrapper {{
-                position: relative;
-                display: inline-block; /* Tight fit */
-                width: {img_width_style};
-                min-width: 100px;
-                box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-                background: white;
-            }}
-            
-            #main-image {{
-                width: 100%; display: block;
-            }}
-            
-            /* --- Overlays --- */
-            .box {{
-                position: absolute;
-                border: 1px solid rgba(0,0,0,0.05); /* Almost invisible hint */
-                cursor: pointer;
-                transition: 0.1s;
-                z-index: 10;
-            }}
-            .box:hover {{
-                border: 2px solid #0068c9;
-                background: rgba(0, 104, 201, 0.1);
-                z-index: 20;
-            }}
-            .box.active {{
-                border: 2px solid #ff2b2b;
-                z-index: 30;
-            }}
-            .box.filtered-match {{
-                background-color: rgba(255, 215, 0, 0.3);
-                border: 1px solid orange;
-            }}
-            
-            /* Tooltip */
-            #tooltip {{
-                position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
-                background: rgba(0,0,0,0.8); color: white;
-                padding: 6px 12px; border-radius: 4px; font-size: 14px;
-                display: none; z-index: 999; pointer-events: none;
-            }}
-            
-            /* --- Text List UI --- */
-            .search-header {{
-                padding: 8px;
-                background: #f8f9fa;
-                border-bottom: 1px solid #eee;
-            }}
-            #local-search-input {{
-                width: 95%;
-                padding: 6px;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                font-size: 13px;
-            }}
-            #text-list {{
-                flex: 1;
-                overflow-y: auto;
-            }}
-            .text-item {{
-                padding: 8px 10px;
-                border-bottom: 1px solid #f0f0f0;
-                font-size: 13px;
-                cursor: pointer;
-                color: #333;
-            }}
-            .text-item:hover {{ background: #f0f5ff; }}
-            .text-item.active {{ background: #e6f0ff; border-left: 3px solid #0068c9; }}
-            .text-item.hidden {{ display: none; }}
-            .text-id {{ font-size: 10px; color: #999; margin-bottom: 2px; display: block; }}
-            
-        </style>
-    </head>
-    <body>
-
-    <div class="main-container">
-        <!-- Image Area -->
-        <div class="image-column">
-            <!-- Sync Scrollbar (Top) -->
-            <div id="top-scroll-track">
-                <div id="top-scroll-dummy"></div>
-            </div>
-            
-            <!-- Main Scroll View -->
-            <div id="image-scroll-view" onscroll="syncScroll()">
-                <div id="image-wrapper">
-                    <img id="main-image" src="data:image/jpeg;base64,{img_b64}">
-                    <div id="boxes-layer"></div>
-                </div>
-            </div>
-            <div id="tooltip"></div>
-            
-            <label style="position: absolute; top: 30px; left: 30px; background: rgba(255,255,255,0.8); padding: 5px; z-index: 900; font-size: 12px; border-radius:3px;">
-                <input type="checkbox" onchange="document.body.classList.toggle('show-all-boxes', this.checked)"> 显示所有边框
-            </label>
-        </div>
+def save_data(layout_path, markdown_path, regions):
+    """Save updated regions to JSON and regenerate Markdown."""
+    try:
+        # 1. Save JSON
+        # Load original to keep other fields (version, etc.) if any
+        with open(layout_path, 'r', encoding='utf-8') as f:
+            full_data = json.load(f)
         
-        <!-- Text Area -->
-        <div class="text-column">
-            <div class="search-header">
-                <input type="text" id="local-search-input" placeholder="在当前页查找 (Local Search)..." oninput="filterList()">
-            </div>
-            <div id="text-list"></div>
-        </div>
-    </div>
-
-    <script>
-        const regions = {js_regions_json};
-        const showTextList = { 'true' if show_text_list else 'false' };
+        full_data['regions'] = regions
         
-        let activeId = null;
+        with open(layout_path, 'w', encoding='utf-8') as f:
+            json.dump(full_data, f, ensure_ascii=False, indent=2)
+            
+        # 2. Update Markdown (Simple regeneration)
+        # Sort regions by order or top-to-bottom
+        regions_sorted = sorted(regions, key=lambda x: x.get('order', x.get('id', 0)))
         
-        // --- Init ---
-        (function init() {{
-            const boxLayer = document.getElementById('boxes-layer');
-            const listEl = document.getElementById('text-list');
-            const topTrack = document.getElementById('top-scroll-track');
-            const view = document.getElementById('image-scroll-view');
-            
-            // Sync Top Scrollbar
-            topTrack.addEventListener('scroll', () => {{
-                view.scrollLeft = topTrack.scrollLeft;
-            }});
-            view.addEventListener('scroll', () => {{
-                topTrack.scrollLeft = view.scrollLeft;
-            }});
-            
-            // Render
-            regions.forEach(r => {{
-                // Box
-                const box = document.createElement('div');
-                box.className = 'box';
-                box.id = 'b-' + r.id;
-                box.style.left = r.x + '%';
-                box.style.top = r.y + '%';
-                box.style.width = r.w + '%';
-                box.style.height = r.h + '%';
-                box.title = r.text; // Native tooltip
-                
-                box.onclick = (e) => {{ e.stopPropagation(); activate(r.id); }};
-                boxLayer.appendChild(box);
-                
-                // List Item
-                if (showTextList) {{
-                    const item = document.createElement('div');
-                    item.className = 'text-item';
-                    item.id = 't-' + r.id;
-                    item.innerHTML = `<span class="text-id">#${{r.id}}</span>${{r.text}}`;
-                    item.onclick = () => activate(r.id);
-                    listEl.appendChild(item);
-                }}
-            }});
-            
-             // Style for show all
-            const style = document.createElement('style');
-            style.innerHTML = `
-                .show-all-boxes .box {{ border: 1px solid rgba(255,0,0,0.3); }}
-            `;
-            document.head.appendChild(style);
-        }})();
-
-        // --- Interaction ---
-        function activate(id) {{
-            if (activeId === id) return;
-            
-            // Unset old
-            if (activeId) {{
-                const oldB = document.getElementById('b-' + activeId);
-                const oldT = document.getElementById('t-' + activeId);
-                if (oldB) oldB.classList.remove('active');
-                if (oldT) oldT.classList.remove('active');
-            }}
-            
-            activeId = id;
-            const newB = document.getElementById('b-' + id);
-            const newT = document.getElementById('t-' + id);
-            
-            if (newB) {{
-                newB.classList.add('active');
-                if (!isShowTextList()) {{
-                    showTooltip(regions.find(x => x.id === id).text);
-                }}
-            }}
-            
-            if (newT && isShowTextList()) {{
-                newT.classList.add('active');
-                newT.scrollIntoView({{behavior: "smooth", block: "center"}});
-            }}
-        }}
+        md_content = f"# {os.path.basename(os.path.dirname(markdown_path))}\n\n"
+        for r in regions_sorted:
+            text = r.get('text', '').strip()
+            if text:
+                md_content += f"{text}\n\n"
         
-        function isShowTextList() {{ return { 'true' if show_text_list else 'false' }; }}
+        with open(markdown_path, 'w', encoding='utf-8') as f:
+            f.write(md_content)
+            
+        return True
+    except Exception as e:
+        st.error(f"Save Failed: {e}")
+        return False
+
+def draw_annotations(image_path, regions, selected_id=None):
+    """Draw bounding boxes on image using PIL."""
+    try:
+        img = Image.open(image_path).convert("RGBA")
+        overlay = Image.new("RGBA", img.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(overlay)
         
-        function showTooltip(text) {{
-            const tt = document.getElementById('tooltip');
-            tt.innerText = text;
-            tt.style.display = 'block';
-            setTimeout(() => tt.style.display = 'none', 3000);
-        }}
+        try:
+            # Try to load a font, otherwise default
+            # Linux path often: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size=30)
+        except:
+            font = None 
+            
+        for r in regions:
+            bbox = r.get('bbox')
+            if not bbox or len(bbox) != 4: continue
+            
+            rid = r.get('id')
+            is_selected = (str(rid) == str(selected_id))
+            
+            # Color scheme
+            # Unselected: Blue, semi-transparent
+            # Selected: Red, solid outline, brighter fill
+            if is_selected:
+                fill_color = (255, 0, 0, 80)
+                outline_color = (255, 0, 0, 255)
+                width = 5
+            else:
+                fill_color = (0, 0, 255, 20)
+                outline_color = (0, 0, 255, 100)
+                width = 2
+            
+            draw.rectangle(bbox, fill=fill_color, outline=outline_color, width=width)
+            
+            # Draw ID Text
+            text_pos = (bbox[0], max(0, bbox[1] - 35))
+            text_display = str(rid)
+            
+            # Text background
+            left, top, right, bottom = draw.textbbox(text_pos, text_display, font=font)
+            draw.rectangle((left-5, top-5, right+5, bottom+5), fill=(255, 255, 255, 200))
+            draw.text(text_pos, text_display, fill=(0,0,0,255), font=font)
+
+        return Image.alpha_composite(img, overlay)
+    except Exception as e:
+        st.error(f"Image Error: {e}")
+        return None
+
+def create_zip_export(pairs):
+    """Create a ZIP file of all current Markdown files."""
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as zf:
+        for p in pairs:
+            if os.path.exists(p['markdown_path']):
+                # Arcname: e.g., 43xxx/43xxx.md
+                folder_name = p['name']
+                zf.write(p['markdown_path'], arcname=f"{folder_name}/{folder_name}.md")
+            if os.path.exists(p['layout_path']):
+                 folder_name = p['name']
+                 zf.write(p['layout_path'], arcname=f"{folder_name}/layout.json")
+    return buffer.getvalue()
+
+# --- Main Logic ---
+
+def main():
+    st.sidebar.title("🔧 设置 & 导航")
+    
+    # 1. Configuration
+    default_img_dir = "images"
+    default_out_dir = "output"
+    
+    # Auto-detect subdirectory in output if exists (e.g. output/full_batch.../)
+    if os.path.exists(default_out_dir):
+        subs = [os.path.join(default_out_dir, d) for d in os.listdir(default_out_dir) if os.path.isdir(os.path.join(default_out_dir, d))]
+        if subs:
+            # Pick the most recent one ideally, or just the first that isn't empty
+            subs.sort()
+            if subs:
+                default_out_dir = subs[-1]
+
+    img_dir = st.sidebar.text_input("图片目录", value=default_img_dir)
+    out_dir = st.sidebar.text_input("数据目录 (Output)", value=default_out_dir)
+    
+    if st.sidebar.button("🔄 刷新文件列表"):
+        st.cache_data.clear()
+
+    # 2. Load File List
+    pairs = load_file_pairs(img_dir, out_dir)
+    
+    if not pairs:
+        st.warning(f"未找到匹配的数据文件。\n请确认路径：\n- 图片目录: `{img_dir}`\n- 数据目录: `{out_dir}`")
+        return
+
+    # 3. Sidebar Filtering/Selection
+    search_query = st.sidebar.text_input("🔍 搜索文件名 (Filter)", "")
+    
+    filtered_pairs = [p for p in pairs if search_query.lower() in p["name"].lower()] if search_query else pairs
+    
+    if not filtered_pairs:
+        st.sidebar.warning("无匹配文件")
+        selected_pair = None
+    else:
+        # Paginator / Selector
+        # Use a selectbox for file navigation
+        filenames = [p["display_name"] for p in filtered_pairs]
+        selected_idx = st.sidebar.selectbox("选择文件", range(len(filenames)), format_func=lambda x: filenames[x])
+        selected_pair = filtered_pairs[selected_idx]
+
+    # 4. Global Actions (Export)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📤 导出")
+    if st.sidebar.button("下载所有结果 (ZIP)"):
+        with st.spinner("打包中..."):
+            zip_data = create_zip_export(pairs)
+        st.sidebar.download_button(
+            label="⬇️ 点击下载 ZIP",
+            data=zip_data,
+            file_name="ocr_results_export.zip",
+            mime="application/zip"
+        )
         
-        // --- Filter ---
-        function filterList() {{
-            const q = document.getElementById('local-search-input').value.toLowerCase();
-            regions.forEach(r => {{
-                const item = document.getElementById('t-' + r.id);
-                const box = document.getElementById('b-' + r.id);
-                
-                const match = r.text.toLowerCase().includes(q);
-                
-                // List visibility
-                if (item) {{
-                    if (match || q === '') item.classList.remove('hidden');
-                    else item.classList.add('hidden');
-                }}
-                
-                // Box highlighting for search
-                if (box) {{
-                    if (q !== '' && match) box.classList.add('filtered-match');
-                    else box.classList.remove('filtered-match');
-                }}
-            }});
-        }}
-    </script>
-    </body>
-    </html>
-    """
-    return html_template
+    # --- Main Content Area ---
+    if selected_pair:
+        render_editor(selected_pair)
+    else:
+        st.info("👈 请在左侧选择一个文件开始校对")
 
-# --- Initialization ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_IMAGES = os.path.join(BASE_DIR, "images")
-DEFAULT_OUTPUT = os.path.join(BASE_DIR, "output")
-
-if "file_pairs" not in st.session_state:
-    st.session_state.file_pairs = []
-    st.session_state.current_index = 0
-
-# --- Sidebar ---
-with st.sidebar:
-    st.title("📂 长沙大公报")
+def render_editor(pair):
+    st.header(f"{pair['display_name']}")
     
-    # Batch Select
-    out_dir = st.text_input("Output Dir", DEFAULT_OUTPUT)
-    batches = get_subdirs(out_dir) if os.path.exists(out_dir) else []
-    sel_batch = st.selectbox("Batch", batches) if batches else None
+    col_img, col_data = st.columns([1.2, 1])
     
-    if st.button("↻ 刷新 / 加载文件"):
-        img_root = DEFAULT_IMAGES
-        work_out = DEFAULT_OUTPUT
-        if sel_batch:
-            work_out = os.path.join(DEFAULT_OUTPUT, sel_batch)
-            guess_img = sel_batch.split('_')[-1] if '_' in sel_batch else sel_batch
-            img_root = os.path.join(DEFAULT_IMAGES, guess_img)
+    # Load Data
+    regions = load_data(pair['layout_path'])
+    
+    if not regions:
+        st.error("无法加载区域数据")
+        return
+
+    # Create DF for Editor
+    df = pd.DataFrame(regions)
+    
+    # Ensure columns exist
+    for col in ['id', 'text', 'region_type', 'bbox']:
+        if col not in df.columns:
+            df[col] = None
+
+    # Reorder columns for display
+    # We display ID at the start
+    df_editor = df[['id', 'region_type', 'text', 'bbox']] 
+
+    with col_data:
+        st.subheader("📝 文本校对")
+        
+        # Save Button & Highlight Selector
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            save_clicked = st.button("💾 保存修改", type="primary", key="save_btn")
             
-        st.session_state.file_pairs = load_files(img_root, work_out)
-        st.session_state.current_index = 0
+        with c2:
+            # Highlight selector inside the toolbar
+             highlight_id = st.selectbox("高亮显示 ID", [None] + list(df['id']), format_func=lambda x: f"ID: {x}" if x is not None else "显示全部", key="hl_select")
 
-    st.markdown("---")
-    
-    # Global Search
-    st.subheader("🔍 全局搜索")
-    g_search = st.text_input("关键词", placeholder="搜索所有文档...")
-    if g_search:
-        results = search_files(g_search, st.session_state.file_pairs)
-        st.caption(f"找到 {len(results)} 处")
-        for res in results[:20]: # Limit display
-            if st.button(f"{res['name']}\n{res['match']}", key=f"s_{res['index']}_{res['match'][:5]}"):
-                st.session_state.current_index = res['index']
-                st.rerun()
-        if len(results) > 20: st.caption("...更多结果省略")
-        st.markdown("---")
-
-    # Navigation
-    pairs = st.session_state.file_pairs
-    if pairs:
-        cur = st.session_state.current_index
-        c1, c2 = st.columns(2)
-        if c1.button("⬅️ 上一页") and cur > 0:
-            st.session_state.current_index -= 1
-            st.rerun()
-        if c2.button("下一页 ➡️") and cur < len(pairs) - 1:
-            st.session_state.current_index += 1
-            st.rerun()
+        # Data Editor
+        # key needs to be unique per file
+        editor_key = f"editor_{pair['name']}"
+        
+        edited_df = st.data_editor(
+            df_editor,
+            key=editor_key,
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                "region_type": st.column_config.SelectboxColumn("类型", options=["text", "title", "header", "footer", "image", "table"], width="small"),
+                "text": st.column_config.TextColumn("识别文本", width="large"),
+                "bbox": st.column_config.TextColumn("坐标", disabled=True)
+            },
+            hide_index=True,
+            use_container_width=True,
+            height=700,
+            num_rows="dynamic"
+        )
+        
+        if save_clicked:
+            # Reconstruct list from DF
+            new_regions = []
             
-        # Jump List
-        names = [p['name'] for p in pairs]
-        new_name = st.selectbox("跳转到文件", names, index=cur)
-        if new_name != names[cur]:
-            st.session_state.current_index = names.index(new_name)
-            st.rerun()
-
-    st.markdown("---")
-    st.caption("界面设置")
-    # Split Ratio Slider
-    split_ratio = st.slider("分割比例 (图/文)", 10, 90, 50, 5, help="调整图片区域和文本区域的宽度比例")
-
-# --- Main Content ---
-if not st.session_state.file_pairs:
-    st.info("请在左侧加载文件文件")
-    st.stop()
-
-data = st.session_state.file_pairs[st.session_state.current_index]
-
-# Compact Title
-st.subheader(f"📄 {data['name']}")
-
-# Tabs
-tab_view, tab_edit = st.tabs(["👁️ 浏览校对", "✏️ 文本编辑"])
-
-with tab_view:
-    # Custom Layout: Tools (Left) | Viewer (Right)
-    c_tools, c_view = st.columns([1, 20])
-    
-    with c_tools:
-        # Vertical-ish Tools
-        st.markdown("**缩放**")
-        zoom = st.slider("Zoom", 20, 400, 100, step=10, label_visibility="collapsed", key="zoom_view")
-    
-    with c_view:
-        if data["layout"]:
-            html = generate_interactive_viewer(data["image"], data["layout"], zoom, show_text_list=True, split_ratio=split_ratio)
-            components.html(html, height=800, scrolling=False)
-        else:
-            st.error("No Layout JSON")
-
-with tab_edit:
-    # Layout: Ref Image (Left) | Editor (Right)
-    # Use split ratio for columns
-    c_ref, c_edit = st.columns([split_ratio, 100-split_ratio])
-    
-    with c_ref:
-        # Zoom above image
-        c_z_label, c_z_slider = st.columns([2, 8])
-        with c_z_label:
-            st.markdown("##### 🔍 缩放")
-        with c_z_slider:
-            zoom_e = st.slider("Zoom", 20, 400, 100, step=10, label_visibility="collapsed", key="zoom_edit")
+            # Need to be careful about preserving other fields if they exist in original JSON but aren't in DF.
+            # load_data only returns 'regions'. 
+            # In save_data, we load 'full_data' again, so we just replace the 'regions' list.
+            # But wait, if we drop fields from individual region objects (like 'confidence'), we lose them.
+            # Let's map back.
             
-        st.caption("参考视图 (Reference)")
-        if data["layout"]:
-            html_ref = generate_interactive_viewer(data["image"], data["layout"], zoom_e, show_text_list=False)
-            components.html(html_ref, height=800, scrolling=False)
+            # Create a dict map of original regions by ID for easy lookup of extra fields
+            original_map = {str(r.get('id')): r for r in regions}
             
-    with c_edit:
-        # Header + Find/Replace (Right Aligned)
-        c_title, c_f, c_r, c_b = st.columns([2, 1.5, 1.5, 0.8])
-        with c_title:
-             st.caption("Markdown 编辑 (Editor)")
-        with c_f:
-             find_txt = st.text_input("Find", placeholder="查找内容", label_visibility="collapsed", key="ft")
-        with c_r:
-             repl_txt = st.text_input("Replace", placeholder="替换为", label_visibility="collapsed", key="rt")
-        with c_b:
-             do_replace = st.button("替换", key="btn_rep")
-
-        if data["markdown"] and os.path.exists(data["markdown"]):
-            with open(data["markdown"], "r", encoding="utf-8") as f:
-                content = f.read()
+            for index, row in edited_df.iterrows():
+                rid = row['id']
+                # If it's a new row added by user, it might not have an ID or valid bbox?
+                # st.data_editor adds rows with None/default values.
+                # If ID is missing, we should auto-generate or skip? 
+                # For now assume mostly edits. New rows might be tricky without logic to add bbox.
                 
-            if do_replace and find_txt:
-                count = content.count(find_txt)
-                if count > 0:
-                    content = content.replace(find_txt, repl_txt)
-                    st.toast(f"已替换 {count} 处匹配")
+                # Basic Reconstruction
+                r = {
+                    "id": rid,
+                    "region_type": row['region_type'],
+                    "text": row['text'],
+                    "bbox": row['bbox']
+                }
+                
+                # Restore extra fields (confidence, etc.) if ID matches
+                if str(rid) in original_map:
+                    orig = original_map[str(rid)]
+                    # Merge orig into r, but let r overwrite keys we edited
+                    # Actually safer: take orig and update with edited fields
+                    merged = orig.copy()
+                    merged.update(r)
+                    new_regions.append(merged)
                 else:
-                    st.toast("未找到匹配项")
+                    # New region? Or ID changed?
+                    # If user adds a row, ID is likely None/Empty. 
+                    # This simple editor doesn't support drawing new boxes, so adding rows is weird.
+                    # We'll just append what we have.
+                    new_regions.append(r)
                 
-            new_content = st.text_area("Content", content, height=750, label_visibility="collapsed")
-            
-            if st.button("💾 保存修改 (Save)"):
-                with open(data["markdown"], "w", encoding="utf-8") as f:
-                    f.write(new_content)
-                st.success("File saved!")
-        else:
-            st.info("No Markdown file found")
+            if save_data(pair['layout_path'], pair['markdown_path'], new_regions):
+                st.toast("✅ 保存成功!", icon="🎉")
+                st.rerun() # Refresh to update any state if needed
+
+    with col_img:
+        st.subheader("🖼️ 图片预览")
+        
+        # Draw on image
+        annotated_img = draw_annotations(pair['image_path'], regions, selected_id=highlight_id)
+        if annotated_img:
+            st.image(annotated_img, use_container_width=True)
+
+if __name__ == "__main__":
+    main()
